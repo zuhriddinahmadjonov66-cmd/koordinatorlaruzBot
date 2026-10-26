@@ -1,1 +1,1223 @@
-aiohttp>=3.12,<4.0
+#!/usr/bin/env python3
+"""Koordinatorlar platformasi Telegram bot.
+
+Ushbu bot Render va Telegram polling rejimida ishlaydi. Aiohttp HTTP server ham
+birga qo'llab-quvvatlanadi. Bu fayl `BOT_TOKEN`, `OWNER_ID`, `ADMIN_TG_ID`,
+`ADMIN_PROFILE_URL`, `PROMO_CODE` va boshqalar environment variable'dan oladi.
+"""
+
+import asyncio
+import json
+import os
+import signal
+import sqlite3
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from aiohttp import web
+
+ROOT = Path(__file__).resolve().parent
+TZ = timezone(timedelta(hours=5))
+
+REGIONS = [
+    "Andijon",
+    "Buxoro",
+    "Farg'ona",
+    "Jizzax",
+    "Namangan",
+    "Navoiy",
+    "Qashqadaryo",
+    "Qoraqalpog'iston Respublikasi",
+    "Samarqand",
+    "Sirdaryo",
+    "Surxondaryo",
+    "Toshkent viloyati",
+    "Toshkent shahri",
+]
+
+DIRECTIONS = [
+    "💻 IT va raqamli texnologiyalar",
+    "📚 Ta’lim va ilm-fan",
+    "🎨 Madaniyat va san’at",
+    "⚽ Sport va sog‘lom turmush tarzi",
+    "🌱 Ekologiya va atrof-muhit muhofazasi",
+    "🤝 Volontyorlik va ijtimoiy loyihalar",
+    "🚀 Tadbirkorlik va innovatsiyalar",
+    "⚖️ Huquqiy savodxonlik va fuqarolik tashabbuslari",
+]
+
+MAIN_MENU = [
+    ["🧭 Koordinator paneli", "📋 Topshiriqlar"],
+    ["📤 Hisobot yuborish", "📖 Koordinator nima?"],
+    ["⭐ PRO obuna", "🎟 Promo kod"],
+    ["🏆 Turnir va o‘yinlar", "🆘 Adminga murojaat"],
+    ["ℹ️ Bot haqida", "👤 Profilim"],
+]
+
+PRO_MENU = [
+    ["📸 Media qo‘llanma", "📘 Koordinator darsligi"],
+    ["📋 Topshiriqlar", "📤 Hisobot yuborish"],
+    ["👤 Profilim", "🆘 Adminga murojaat"],
+]
+
+TASK_STATUSES = [
+    "yangi",
+    "bajarilmoqda",
+    "hisobot yuborilgan",
+    "qabul qilingan",
+    "tuzatishga qaytarilgan",
+    "baholash kutilmoqda",
+]
+
+
+def load_env():
+    dotenv_path = ROOT / ".env"
+    if dotenv_path.exists():
+        for line in dotenv_path.read_text(encoding="utf-8-sig").splitlines():
+            if not line or line.strip().startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class Telegram:
+    def __init__(self, token):
+        self.base = "https://api.telegram.org/bot" + token + "/"
+
+    def call(self, method, **data):
+        body = json.dumps(data).encode("utf-8")
+        req = urllib.request.Request(
+            self.base + method,
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as response:
+                result = json.load(response)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Telegram HTTP {exc.code}") from None
+        except (urllib.error.URLError, TimeoutError):
+            raise RuntimeError("Telegram bilan aloqa yo‘q") from None
+        if not result.get("ok"):
+            raise RuntimeError("Telegram so‘rovni qabul qilmadi")
+        return result["result"]
+
+
+class App:
+    def __init__(self, db_path, api, owner_id, directions):
+        self.db = sqlite3.connect(db_path)
+        self.db.row_factory = sqlite3.Row
+        self.api = api
+        self.owner = owner_id
+        self.directions = directions
+        self.db.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                region TEXT,
+                district TEXT,
+                school TEXT,
+                direction TEXT,
+                role TEXT DEFAULT 'member',
+                approved INTEGER DEFAULT 0,
+                phone TEXT,
+                pro_active INTEGER DEFAULT 0,
+                pro_expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                invite_count INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sessions(
+                id INTEGER PRIMARY KEY,
+                kind TEXT,
+                data TEXT
+            );
+            CREATE TABLE IF NOT EXISTS tasks(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                creator INTEGER,
+                title TEXT,
+                due TEXT,
+                region TEXT,
+                district TEXT,
+                direction TEXT,
+                status TEXT DEFAULT 'yangi',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS reports(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER,
+                user_id INTEGER,
+                direction TEXT,
+                body TEXT,
+                file_id TEXT,
+                file_kind TEXT,
+                status TEXT DEFAULT 'baholash kutilmoqda',
+                score INTEGER,
+                note TEXT,
+                reviewer_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(task_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS media_guide(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS suggestions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid INTEGER,
+                body TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS promo_usage(
+                code TEXT,
+                user_id INTEGER,
+                used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(code, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS admin_messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                text TEXT,
+                status TEXT DEFAULT 'yangi',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS data_delete_requests(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                status TEXT DEFAULT 'kutilmoqda',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS quiz_results(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                full_name TEXT,
+                telegram_id INTEGER,
+                score INTEGER,
+                total INTEGER,
+                percent INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                best_score INTEGER,
+                best_percent INTEGER,
+                attempts INTEGER DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS invitations(
+                inviter_id INTEGER,
+                invitee_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(inviter_id, invitee_id)
+            );
+            CREATE TABLE IF NOT EXISTS meta(
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS reminders(
+                task_id INTEGER,
+                user_id INTEGER,
+                PRIMARY KEY(task_id, user_id)
+            );
+            """
+        )
+        self.ensure_admin()
+
+    def ensure_admin(self):
+        existing = self.one("SELECT id FROM users WHERE id=?", (self.owner,))
+        if not existing:
+            self.write(
+                "INSERT INTO users(id, name, role, approved, region, district, school, direction) VALUES(?,?,?,?,?,?,?,?)",
+                (self.owner, "Bosh administrator", "owner", 1, "", "", "", ""),
+            )
+        else:
+            self.write(
+                "UPDATE users SET name=COALESCE(name,'Bosh administrator'), role='owner', approved=1 WHERE id=?",
+                (self.owner,),
+            )
+
+    def one(self, sql, args=()):
+        return self.db.execute(sql, args).fetchone()
+
+    def rows(self, sql, args=()):
+        return self.db.execute(sql, args).fetchall()
+
+    def write(self, sql, args=()):
+        cur = self.db.execute(sql, args)
+        self.db.commit()
+        return cur.lastrowid
+
+    def send(self, uid, text, keyboard=None, disable_web_page_preview=True):
+        if keyboard is None:
+            keyboard = MAIN_MENU
+        try:
+            for start in range(0, len(text), 3800):
+                self.api.call(
+                    "sendMessage",
+                    chat_id=uid,
+                    text=text[start : start + 3800],
+                    reply_markup={"keyboard": keyboard, "resize_keyboard": True},
+                    disable_web_page_preview=disable_web_page_preview,
+                )
+        except RuntimeError:
+            pass
+
+    def notify(self, uid, text):
+        if uid is None:
+            return
+        try:
+            self.send(uid, text)
+        except Exception:
+            pass
+
+    def user(self, uid):
+        return self.one("SELECT * FROM users WHERE id=?", (uid,))
+
+    def session(self, uid, kind, data):
+        self.write("INSERT OR REPLACE INTO sessions(id, kind, data) VALUES(?,?,?)", (uid, kind, json.dumps(data, ensure_ascii=False)))
+
+    def clear_session(self, uid):
+        self.write("DELETE FROM sessions WHERE id=?", (uid,))
+
+    def get_session(self, uid):
+        row = self.one("SELECT * FROM sessions WHERE id=?", (uid,))
+        if not row:
+            return None
+        data = row["data"]
+        try:
+            return row["kind"], json.loads(data or "{}")
+        except Exception:
+            return row["kind"], {}
+
+    def is_manager(self, user_row):
+        if not user_row or not user_row["approved"]:
+            return False
+        return user_row["role"] in ("owner", "region", "district")
+
+    def is_owner(self, user_row):
+        return user_row and user_row["role"] == "owner" and user_row["approved"]
+
+    def has_pro(self, uid):
+        u = self.user(uid)
+        if not u:
+            return False
+        if not u["pro_active"]:
+            return False
+        if not u["pro_expires_at"]:
+            return False
+        try:
+            expires = datetime.strptime(u["pro_expires_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+            return datetime.now(TZ) < expires
+        except Exception:
+            return False
+
+    def is_visible_task(self, user_row, task_row):
+        if not user_row or not user_row["approved"]:
+            return False
+        if not task_row:
+            return False
+        if user_row["role"] == "owner":
+            return True
+        if task_row["region"] and task_row["region"] != user_row["region"]:
+            return False
+        if task_row["district"] and task_row["district"] != user_row["district"]:
+            return False
+        if task_row["direction"] and task_row["direction"] != user_row["direction"]:
+            return False
+        return True
+
+    def can_review_task(self, user_row, task_row):
+        if not self.is_manager(user_row):
+            return False
+        if user_row["role"] == "owner":
+            return True
+        if task_row["region"] != user_row["region"]:
+            return False
+        if user_row["role"] == "region":
+            return True
+        if user_row["role"] == "district":
+            return task_row["district"] == user_row["district"]
+        return False
+
+    def get_rating_summary(self):
+        rows = self.rows(
+            """
+            SELECT AVG(score) AS avg_score, direction FROM reports
+            WHERE score IS NOT NULL AND score BETWEEN 1 AND 10
+            GROUP BY direction
+            ORDER BY avg_score DESC
+            """
+        )
+        overall = self.one("SELECT AVG(score) AS avg_score FROM reports WHERE score IS NOT NULL AND score BETWEEN 1 AND 10")
+        return overall, rows
+
+    def render_profile(self, user_row):
+        if not user_row:
+            return "Foydalanuvchi topilmadi."
+        parts = [
+            f"👤 Ism: {user_row['name'] or 'Noma’lum'}",
+            f"🆔 Telegram ID: {user_row['id']}",
+            f"📍 Hudud: {user_row['region'] or 'Ko‘rsatilmagan'}",
+            f"🏙 Tuman: {user_row['district'] or 'Ko‘rsatilmagan'}",
+            f"🏫 Maktab: {user_row['school'] or 'Ko‘rsatilmagan'}",
+            f"🧭 Yo‘nalish: {user_row['direction'] or 'Ko‘rsatilmagan'}",
+            f"👑 Rol: {user_row['role']}",
+            f"📌 Tasdiqlangan: {'Ha' if user_row['approved'] else 'Yo‘q'}",
+            f"⭐ PRO: {'Faol' if self.has_pro(user_row['id']) else 'Yoq'}",
+            f"📆 PRO tugash sanasi: {user_row['pro_expires_at'] or 'Yo‘q'}",
+        ]
+        return "\n".join(parts)
+
+    def get_admin_profile_url(self):
+        return os.environ.get("ADMIN_PROFILE_URL", "").strip()
+
+    def keyboard_for_main(self, user_row):
+        menu = MAIN_MENU
+        if self.has_pro(user_row["id"]):
+            menu = PRO_MENU
+        return menu
+
+    def handle(self, message):
+        if message.get("chat", {}).get("type") != "private":
+            return
+        uid = int(message.get("from", {}).get("id"))
+        text = (message.get("text") or "").strip()
+        u = self.user(uid)
+        command = text.split()[0].split("@") [0] if text else ""
+
+        if command == "/id":
+            self.send(uid, f"Telegram ID: {uid}")
+            return
+
+        if text in ("❌ Bekor qilish", "/cancel"):
+            self.clear_session(uid)
+            self.send(uid, "Bekor qilindi.")
+            return
+
+        if command == "/start":
+            self.clear_session(uid)
+            if not u:
+                self.session(uid, "register_name", {})
+                self.send(uid, "Assalomu alaykum! Botga ro‘yxatdan o‘tish uchun ismingizni kiriting:")
+                return
+            if not u["approved"]:
+                self.send(uid, "Arizangiz tasdiqlanishini kutyapti. Iltimos, admin roziligini kuting.")
+                return
+            self.send(uid, "Bosh menyu", self.keyboard_for_main(u))
+            return
+
+        if command == "/help":
+            self.send(
+                uid,
+                "\n".join(
+                    [
+                        "Botdan foydalanish bo‘yicha ko‘rsatma:",
+                        "/start — bosh menyu",
+                        "/cancel — bekor qilish",
+                        "/id — Telegram ID ni ko‘rish",
+                        "/report 12 — topshiriq bo‘yicha hisobot yuborish",
+                        "/promo 123 — promo kodni kiritish",
+                        "/delete_data — ma’lumotlarni o‘chirish so‘rovi",
+                        "/help — yordam",
+                    ]
+                ),
+            )
+            return
+
+        if command == "/delete_data":
+            self.write(
+                "INSERT OR IGNORE INTO data_delete_requests(user_id) VALUES(?)",
+                (uid,),
+            )
+            self.notify(self.owner, f"Ma’lumotlarni o‘chirish so‘rovi: {uid}")
+            self.send(uid, "Ma’lumotlar o‘chirish so‘rovi adminga yuborildi. Admin tasdiqlagach, ma’lumotlaringiz o‘chiriladi.")
+            return
+
+        if command == "/promo":
+            code = text.split(maxsplit=1)[1].strip() if len(text.split()) > 1 else ""
+            self.process_promo(uid, code)
+            return
+
+        session = self.get_session(uid)
+        if not u:
+            self.send(uid, "Avval /start bosing.")
+            return
+
+        if not u["approved"]:
+            self.send(uid, "Arizangiz hali tasdiqlanmagan. Adminning tasdig‘i kutilmoqda.")
+            return
+
+        if session:
+            kind, payload = session
+            if kind == "register_name":
+                name = text.strip()
+                if not name or len(name) > 80:
+                    self.send(uid, "Iltimos, 1–80 belgidan iborat ismingizni kiriting.")
+                    return
+                self.write("UPDATE users SET name=? WHERE id=?", (name, uid))
+                self.session(uid, "register_region", {"name": name})
+                self.send(uid, "Hududingizni tanlang:", [[r] for r in REGIONS])
+                return
+            if kind == "register_region":
+                region = text.strip()
+                if region not in REGIONS:
+                    self.send(uid, "Viloyatni ro‘yxatdan tanlang.", [[r] for r in REGIONS])
+                    return
+                self.write("UPDATE users SET region=? WHERE id=?", (region, uid))
+                self.session(uid, "register_district", {"region": region})
+                self.send(uid, "Tuman/shahar nomini yozing:")
+                return
+            if kind == "register_district":
+                district = text.strip()
+                if not district or len(district) > 80:
+                    self.send(uid, "Tuman yoki shahar nomini to‘g‘ri kiriting.")
+                    return
+                self.write("UPDATE users SET district=? WHERE id=?", (district, uid))
+                self.session(uid, "register_school", {})
+                self.send(uid, "Maktab yoki tashkilot nomini yozing:")
+                return
+            if kind == "register_school":
+                school = text.strip()
+                if not school or len(school) > 150:
+                    self.send(uid, "Maktab nomini 1–150 belgi oralig‘ida kiriting.")
+                    return
+                self.write("UPDATE users SET school=? WHERE id=?", (school, uid))
+                self.session(uid, "register_direction", {})
+                self.send(uid, "Yo‘nalishingizni tanlang:", [[d] for d in DIRECTIONS])
+                return
+            if kind == "register_direction":
+                direction = text.strip()
+                if direction not in DIRECTIONS:
+                    self.send(uid, "Yo‘nalishni ro‘yxatdan tanlang.", [[d] for d in DIRECTIONS])
+                    return
+                self.write("UPDATE users SET direction=? WHERE id=?", (direction, uid))
+                self.clear_session(uid)
+                self.send(uid, "Ro‘yxatdan o‘tishingiz yakunlandi. Admin tasdiqlashi kutilmoqda.")
+                self.notify(self.owner, f"Yangi foydalanuvchi: {uid} | {u['name']} | {u['region']} | {u['direction']}")
+                return
+            if kind == "task_create":
+                payload = payload or {}
+                title = text.strip()
+                if not title:
+                    self.send(uid, "Topshiriq sarlavhasini kiriting.")
+                    return
+                payload["title"] = title
+                self.write(
+                    "INSERT INTO tasks(creator, title, due, region, district, direction, status) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        uid,
+                        payload["title"],
+                        payload.get("due", ""),
+                        payload.get("region", ""),
+                        payload.get("district", ""),
+                        payload.get("direction", ""),
+                        "yangi",
+                    ),
+                )
+                self.clear_session(uid)
+                self.send(uid, "Topshiriq saqlandi.")
+                return
+            if kind == "report":
+                task_id = safe_int(payload.get("task_id"), 0)
+                if not task_id:
+                    self.clear_session(uid)
+                    return
+                body = text.strip() if text else ""
+                if not body and not message.get("photo") and not message.get("document"):
+                    self.send(uid, "Hisobot matni yoki fayl biriktiring.")
+                    return
+                file_id = ""
+                file_kind = ""
+                if message.get("photo"):
+                    file_id = message["photo"][-1]["file_id"]
+                    file_kind = "photo"
+                elif message.get("document"):
+                    file_id = message["document"]["file_id"]
+                    file_kind = "document"
+                body = body or (message.get("caption") or "")
+                if not body:
+                    self.send(uid, "Hisobot uchun izoh yozing.")
+                    return
+                task = self.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+                if not task or not self.is_visible_task(u, task):
+                    self.send(uid, "Bu topshiriq sizga tegishli emas.")
+                    self.clear_session(uid)
+                    return
+                self.write(
+                    "INSERT INTO reports(task_id, user_id, direction, body, file_id, file_kind, status) VALUES(?,?,?,?,?,?,?) "
+                    "ON CONFLICT(task_id, user_id) DO UPDATE SET body=excluded.body, file_id=excluded.file_id, file_kind=excluded.file_kind, direction=excluded.direction, status='hisobot yuborilgan'",
+                    (task_id, uid, task["direction"], body, file_id, file_kind, "hisobot yuborilgan"),
+                )
+                self.clear_session(uid)
+                self.send(uid, "Hisobot yuborildi. Admin tekshirib, baholashga tayyorlaydi.")
+                self.notify(task["creator"], f"#{task_id} topshiriq bo‘yicha yangi hisobot yuborildi.")
+                return
+            if kind == "support":
+                text_value = text.strip()
+                if not text_value or len(text_value) > 3000:
+                    self.send(uid, "Murojaat matni 1–3000 belgidan iborat bo‘lishi kerak.")
+                    return
+                self.write("INSERT INTO admin_messages(user_id, text) VALUES(?,?)", (uid, text_value))
+                self.clear_session(uid)
+                self.send(uid, "Murojaatingiz adminga yuborildi. Admin javob berishidan so‘ng xabar sizga keladi.")
+                self.notify(self.owner, f"Yangi murojaat: {uid}\n{text_value}")
+                return
+            if kind == "promo_code":
+                self.process_promo(uid, text.strip())
+                self.clear_session(uid)
+                return
+            if kind == "quiz":
+                # handled elsewhere
+                pass
+
+        if text == "🧭 Koordinator paneli":
+            self.send(
+                uid,
+                "Koordinator paneli:\n- topshiriq yaratish\n- hisobotlarni ko‘rish\n- ball berish\n- reytingni tekshirish",
+            )
+            return
+
+        if text == "📋 Topshiriqlar":
+            tasks = []
+            for row in self.rows("SELECT * FROM tasks ORDER BY id DESC"):
+                if self.is_visible_task(u, row):
+                    report = self.one("SELECT * FROM reports WHERE task_id=? AND user_id=?", (row["id"], uid))
+                    status = report["status"] if report else "yuborilmagan"
+                    tasks.append(f"#{row['id']} — {row['title']}\nHudud: {row['region'] or 'Barchasi'} | {row['district'] or 'Barchasi'}\nYo‘nalish: {row['direction'] or 'Barchasi'}\nMuddat: {row['due'] or 'Belgilanmagan'}\nHolat: {status}\n/report {row['id']}")
+            self.send(uid, "\n\n".join(tasks) if tasks else "Sizga tegishli topshiriqlar yo‘q.")
+            return
+
+        if text == "📤 Hisobot yuborish":
+            self.send(uid, "Topshiriq raqamini kiriting, masalan: /report 12")
+            return
+
+        if command == "/report":
+            if len(text.split()) < 2:
+                self.send(uid, "Masalan: /report 12")
+                return
+            task_id = safe_int(text.split()[1], 0)
+            task = self.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+            if not task or not self.is_visible_task(u, task):
+                self.send(uid, "Bu topshiriq sizga tegishli emas yoki mavjud emas.")
+                return
+            self.session(uid, "report", {"task_id": task_id})
+            self.send(uid, "Hisobot matnini yozing. So‘ngra rasm yoki hujjat biriktirishingiz mumkin.")
+            return
+
+        if text == "📖 Koordinator nima?":
+            self.send(
+                uid,
+                "Koordinator — bu hudud bo‘yicha faoliyatni muvofiqlashtiruvchi, topshiriqlarni tayinlovchi, natijalarni kuzatuvchi va hisobotlarni tekshiruvchi shaxsdir.\n\nU quyidagilarni bajara oladi:\n- topshiriqlarni qaysi yo‘nalishga yuborishni belgilash;\n- ishtirokchilarni hudud va yo‘nalish bo‘yicha boshqarish;\n- hisobotlarni qabul qilish, qaytarish yoki baholash;\n- natijalarni yig‘ish va ma’lumotlarni adminga yetkazish.\n\nRasmiy manbaa: koordinatorlik vazifalari haqidagi rasmiy hujjat topilmaganligi sababli, ma’lumot admin tomonidan keyin to‘ldirilishi mumkin. Rasmiy manbada aniqlanmadi."
+            )
+            return
+
+        if text == "⭐ PRO obuna":
+            self.send(
+                uid,
+                "PRO obuna haqida ma’lumot:\n- Narxi: 10 000 so‘m / 1 oy\n- Amal qilish muddati: 1 oy\n- Mavjud funksiyalar: media qo‘llanma va koordinator darsligi\n- To‘lov tizimi hozircha ulanmagan. Foydalanuvchi admin bilan bog‘lanishi kerak.\n\nAdminga murojaat qiling yoki /delete_data dan so‘rov yuboring. Admin to‘lovni tekshirib PRO muddatini qo‘lda faollashtiradi.",
+            )
+            return
+
+        if text == "🎟 Promo kod":
+            self.session(uid, "promo_code", {})
+            self.send(uid, "Promo kodni kiriting:")
+            return
+
+        if text == "🏆 Turnir va o‘yinlar":
+            self.send(
+                uid,
+                "Turnir va o‘yinlar:\n1) DLS turniri\n2) Dunyoviy bilim testi\n3) 5 ta odam taklif qil — promo kod" ,
+            )
+            return
+
+        if text == "DLS turniri":
+            self.session(uid, "dls_register", {})
+            self.send(uid, "Iltimos, quyidagilarni kiriting: ism, DLS akkaunt nomi, telefon raqami. Telefon raqami faqat turnir tashkilotchisiga yuboriladi.")
+            return
+
+        if text == "Dunyoviy bilim testi":
+            self.start_quiz(uid)
+            return
+
+        if text == "5 ta odam taklif qil — promo kod":
+            self.send(uid, "Taklif qilish qoidalari:\n- Faqat yangi foydalanuvchi botni ishga tushirib, ro‘yxatdan o‘tib tasdiqlanganda hisobga olinadi;\n- Bir odamni qayta-qayta sanamaylik;\n- Bir martalik bonus yoki promo kod admin tomonidan tasdiqlanadi.")
+            return
+
+        if text == "🆘 Adminga murojaat":
+            self.session(uid, "support", {})
+            admin_link = self.get_admin_profile_url()
+            if admin_link:
+                self.send(uid, f"Admin profil havolasi: {admin_link}\nSavolingizni, taklifingizni yoki xatosini yozing.")
+            else:
+                self.send(uid, "Admin profil havolasi sozlanmagan. Murojaatni quyida yozib yuboring, admin uni ko‘rib chiqadi.")
+            return
+
+        if text == "ℹ️ Bot haqida":
+            self.send(
+                uid,
+                "Bot yaratuvchisi: Zuhriddin Ahmadjonov\n\nBu bot koordinatorlar, topshiriqlar, hisobotlar, reyting, PRO obuna, DLS turniri va bilim testini boshqarish uchun ishlatiladi.\n\nMa’lumotlar maxfiylik tamoyiliga muvofiq ishlatiladi. Foydalanuvchi Telegram ID, telefon raqami va topshiriq hisobotlari ommaviy reytingda yoki boshqa foydalanuvchilarga ko‘rsatilmaydi.",
+            )
+            return
+
+        if text == "👤 Profilim":
+            self.send(uid, self.render_profile(u), self.keyboard_for_main(u))
+            return
+
+        if text == "📸 Media qo‘llanma" and self.has_pro(uid):
+            self.send(
+                uid,
+                "Media qo‘llanma:\n1) Rasmga aniq va bazm ko‘rinishni tanlang.\n2) Fon va yorug‘likni tekshiring.\n3) Xabar matni qisqa bo‘lsin.\n4) Rasm javobgarlik va maxfiylik tamoyillariga muvofiq bo‘lsin.\n5) Hujjat yoki rasm o‘lchami va formatni nazorat qiling."
+            )
+            return
+
+        if text == "📘 Koordinator darsligi" and self.has_pro(uid):
+            self.send(
+                uid,
+                "Koordinator darsligi:\n- rejalashtirish;\n- jamoa bilan ishlash;\n- topshiriq bajarish;\n- hisobot tayyorlash;\n- natijalarni tahlil qilish."
+            )
+            return
+
+        if command == "/newtask":
+            if not self.is_manager(u):
+                self.send(uid, "Faqat mas’ul yoki admin topshiriq yaratishi mumkin.")
+                return
+            self.session(uid, "task_create", {})
+            self.send(uid, "Topshiriq sarlavhasini kiriting.")
+            return
+
+        if command == "/accept":
+            if not self.is_manager(u):
+                self.send(uid, "Sizga bu amal uchun vakolat yo‘q.")
+                return
+            parts = text.split()
+            if len(parts) < 3:
+                self.send(uid, "Misol: /accept 12 345")
+                return
+            task_id = safe_int(parts[1], 0)
+            report_user = safe_int(parts[2], 0)
+            report_row = self.one("SELECT * FROM reports WHERE task_id=? AND user_id=?", (task_id, report_user))
+            if not report_row:
+                self.send(uid, "Bunday hisobot topilmadi.")
+                return
+            task = self.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+            if not task or not self.can_review_task(u, task):
+                self.send(uid, "Siz ushbu topshiriq uchun baholashga vakolatli emassiz.")
+                return
+            self.write(
+                "UPDATE reports SET status='qabul qilingan', reviewer_id=?, score=COALESCE(score, 10), note=COALESCE(note, '') WHERE task_id=? AND user_id=?",
+                (uid, task_id, report_user),
+            )
+            self.send(uid, "Hisobot qabul qilindi.")
+            self.notify(report_user, f"#{task_id} topshiriq uchun hisobotingiz qabul qilindi.")
+            return
+
+        if command == "/return":
+            if not self.is_manager(u):
+                self.send(uid, "Sizga bu amal uchun vakolat yo‘q.")
+                return
+            parts = text.split(maxsplit=3)
+            if len(parts) < 4:
+                self.send(uid, "Misol: /return 12 345 " + '"Tuzatish kerak"')
+                return
+            task_id = safe_int(parts[1], 0)
+            report_user = safe_int(parts[2], 0)
+            note = parts[3].strip()
+            task = self.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+            if not task or not self.can_review_task(u, task):
+                self.send(uid, "Siz ushbu topshiriq uchun baholashga vakolatli emassiz.")
+                return
+            self.write(
+                "UPDATE reports SET status='tuzatishga qaytarilgan', reviewer_id=?, note=? WHERE task_id=? AND user_id=?",
+                (uid, note, task_id, report_user),
+            )
+            self.send(uid, "Hisobot tuzatishga qaytarildi.")
+            self.notify(report_user, f"#{task_id} topshiriq bo‘yicha hisobot tuzatishga qaytarildi. Sabab: {note}")
+            return
+
+        if command == "/rate":
+            if not self.is_manager(u):
+                self.send(uid, "Faqat vakolatli mas’ul ball bera oladi.")
+                return
+            parts = text.split(maxsplit=4)
+            if len(parts) < 5:
+                self.send(uid, "Misol: /rate 12 345 8 " + '"Yaxshi ishladi"')
+                return
+            task_id = safe_int(parts[1], 0)
+            report_user = safe_int(parts[2], 0)
+            score = safe_int(parts[3], 0)
+            note = parts[4].strip()
+            if not (1 <= score <= 10):
+                self.send(uid, "Ball 1 dan 10 gacha bo‘lishi kerak.")
+                return
+            task = self.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+            if not task or not self.can_review_task(u, task):
+                self.send(uid, "Siz ushbu topshiriq uchun baholashga vakolatli emassiz.")
+                return
+            self.write(
+                "UPDATE reports SET score=?, note=?, reviewer_id=?, status='qabul qilingan' WHERE task_id=? AND user_id=?",
+                (score, note, uid, task_id, report_user),
+            )
+            self.send(uid, "Baholash saqlandi.")
+            self.notify(report_user, f"#{task_id} topshiriq uchun ballingiz {score}/10 bo‘ldi. Izoh: {note}")
+            return
+
+        if command == "/reports":
+            if not self.is_manager(u):
+                self.send(uid, "Sizga bu bo‘limda vakolat yo‘q.")
+                return
+            tasks = self.rows("SELECT * FROM tasks ORDER BY id DESC")
+            output = []
+            for task in tasks:
+                if not self.can_review_task(u, task):
+                    continue
+                reports = self.rows("SELECT * FROM reports WHERE task_id=? ORDER BY created_at DESC", (task["id"],))
+                for report in reports:
+                    output.append(
+                        f"#{task['id']} | foydalanuvchi {report['user_id']} | status: {report['status']} | ball: {report['score'] if report['score'] is not None else 'baholash kutilmoqda'}\n{report['body']}\n/rate {task['id']} {report['user_id']} 8 \"izoh\"\n/accept {task['id']} {report['user_id']}\n/return {task['id']} {report['user_id']} \"sabab\""
+                    )
+            self.send(uid, "\n\n".join(output) if output else "Hisobotlar yo‘q.")
+            return
+
+        if command == "/ratings":
+            overall, directions = self.get_rating_summary()
+            lines = [
+                f"Umumiy reyting: {overall['avg_score'] if overall and overall['avg_score'] is not None else 'Hali baho yo‘q'} / 10"
+            ]
+            for row in directions:
+                lines.append(f"{row['direction']}: {row['avg_score']:.2f} / 10")
+            self.send(uid, "\n".join(lines) if lines else "Hali baho yo‘q.")
+            return
+
+        if command == "/support_view":
+            if not self.is_owner(u):
+                self.send(uid, "Faqat bosh administrator ko‘rishi mumkin.")
+                return
+            items = self.rows("SELECT * FROM admin_messages WHERE status='yangi' ORDER BY id DESC")
+            if not items:
+                self.send(uid, "Yangi murojaatlar yo‘q.")
+                return
+            for item in items:
+                self.send(uid, f"#{item['id']} | user {item['user_id']}\n{item['text']}\n/qabul {item['id']}")
+            return
+
+        if command == "/qabul":
+            if not self.is_owner(u):
+                self.send(uid, "Faqat bosh administrator tasdiqlashi mumkin.")
+                return
+            mid = safe_int(text.split()[1], 0)
+            self.write("UPDATE admin_messages SET status='qabul qilindi' WHERE id=?", (mid,))
+            self.send(uid, "Murojaat qabul qilindi.")
+            return
+
+        if command == "/promo_set":
+            if not self.is_owner(u):
+                self.send(uid, "Faqat admin kodni o‘zgartira oladi.")
+                return
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                self.send(uid, "Misol: /promo_set z1a2b3at")
+                return
+            os.environ["PROMO_CODE"] = parts[1].strip()
+            self.send(uid, "Promo kod yangilandi.")
+            return
+
+        if command == "/promo_clear":
+            if not self.is_owner(u):
+                self.send(uid, "Faqat admin kodni o‘chirib qo‘ya oladi.")
+                return
+            os.environ.pop("PROMO_CODE", None)
+            self.send(uid, "Promo kod o‘chirildi.")
+            return
+
+        if command == "/pro_activate":
+            if not self.is_owner(u):
+                self.send(uid, "Faqat admin PRO holatini o‘zgartira oladi.")
+                return
+            parts = text.split()
+            if len(parts) < 3:
+                self.send(uid, "Misol: /pro_activate 123456789 30")
+                return
+            user_id = safe_int(parts[1], 0)
+            days = safe_int(parts[2], 30)
+            expires = (datetime.now(TZ) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+            self.write(
+                "UPDATE users SET pro_active=1, pro_expires_at=? WHERE id=?",
+                (expires, user_id),
+            )
+            self.send(uid, f"PRO obuna {user_id} uchun {days} kunga faollashtirildi.")
+            self.notify(user_id, f"PRO obunangiz faollashtirildi. Tugash sanasi: {expires}")
+            return
+
+        if text == "DLS turniri":
+            self.send(uid, "Turnirga yozilish uchun quyidagi formatga rioya qiling:\nIsm | DLS akkaunt nomi | Telefon raqami")
+            return
+
+        if "|" in text and "DLS" in text:
+            try:
+                name, dls, phone = [part.strip() for part in text.split("|")]
+                self.write("INSERT OR IGNORE INTO admin_messages(user_id, text, status) VALUES(?,?,?)", (uid, f"DLS turniriga yozilish: {name} | {dls} | {phone}", "yangi"))
+                self.send(uid, "Arizangiz turnir tashkilotchisiga yuborildi.")
+            except Exception:
+                self.send(uid, "Formati noto‘g‘ri. Ism | DLS akkaunt nomi | Telefon raqami ko‘rinishida kiriting.")
+            return
+
+        if text == "Dunyoviy bilim testi":
+            self.start_quiz(uid)
+            return
+
+        if command == "/quiz":
+            self.start_quiz(uid)
+            return
+
+        if command in ("/accept_delete", "/delete_confirm"):
+            if not self.is_owner(u):
+                self.send(uid, "Faqat admin ma’lumotlarni o‘chirishni tasdiqlashi mumkin.")
+                return
+            user_id = safe_int(text.split()[1], 0)
+            self.write("DELETE FROM users WHERE id=?", (user_id,))
+            self.write("DELETE FROM sessions WHERE id=?", (user_id,))
+            self.write("UPDATE data_delete_requests SET status='tasdiqlandi' WHERE user_id=?", (user_id,))
+            self.send(uid, "Foydalanuvchi ma’lumotlari o‘chirildi.")
+            self.notify(user_id, "Ma’lumotlaringiz admin tomonidan o‘chirildi.")
+            return
+
+        if text == "Ma’lumotlarimni o‘chirish":
+            self.write("INSERT OR IGNORE INTO data_delete_requests(user_id) VALUES(?)", (uid,))
+            self.notify(self.owner, f"Ma’lumotlarni o‘chirish so‘rovi: {uid}")
+            self.send(uid, "So‘rov yuborildi. Admin tasdiqlaganidan keyin ma’lumotlar o‘chiriladi.")
+            return
+
+        if command == "/delete_request":
+            self.write("INSERT OR IGNORE INTO data_delete_requests(user_id) VALUES(?)", (uid,))
+            self.notify(self.owner, f"Ma’lumotlarni o‘chirish so‘rovi: {uid}")
+            self.send(uid, "So‘rov yuborildi. Admin tasdiqlaganidan keyin ma’lumotlar o‘chiriladi.")
+            return
+
+        # Informal commands and fallback
+        if text == "📋 Topshiriqlar":
+            return
+
+        self.send(uid, "Menyudan tanlang yoki /help bosing.")
+
+    def process_promo(self, uid, code):
+        if not code:
+            self.send(uid, "Promo kod kiriting.")
+            return
+        promo = os.environ.get("PROMO_CODE", "z1a2b3at").strip()
+        if code != promo:
+            self.send(uid, "Promo kod noto‘g‘ri.")
+            return
+        already = self.one("SELECT 1 FROM promo_usage WHERE code=? AND user_id=?", (promo, uid))
+        if already:
+            self.send(uid, "Bu promo kodni avval ishlatgansiz.")
+            return
+        expires = (datetime.now(TZ) + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        self.write("UPDATE users SET pro_active=1, pro_expires_at=? WHERE id=?", (expires, uid))
+        self.write("INSERT INTO promo_usage(code, user_id) VALUES(?,?)", (promo, uid))
+        self.send(uid, "1 oylik PRO obunangiz faollashtirildi.")
+
+    def start_quiz(self, uid):
+        from quiz_questions import QUESTIONS
+
+        user = self.user(uid)
+        if not user:
+            self.send(uid, "Avval ro‘yxatdan o‘tishingiz kerak.")
+            return
+        session = self.get_session(uid)
+        if session and session[0] == "quiz":
+            pass
+        data = {"questions": QUESTIONS, "index": 0, "answers": {}, "started": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")}
+        self.session(uid, "quiz", data)
+        self.send(uid, f"Dunyoviy bilim testi boshlanmoqda. Savol 1/{len(QUESTIONS)}\n{QUESTIONS[0]['question']}\nA) {QUESTIONS[0]['options'][0]}\nB) {QUESTIONS[0]['options'][1]}\nC) {QUESTIONS[0]['options'][2]}\nD) {QUESTIONS[0]['options'][3]}")
+
+    def handle_quiz_answer(self, uid, answer):
+        from quiz_questions import QUESTIONS
+
+        session = self.get_session(uid)
+        if not session or session[0] != "quiz":
+            return
+        state = session[1]
+        index = int(state.get("index", 0))
+        current = QUESTIONS[index]
+        options = ["A", "B", "C", "D"]
+        answer_key = answer.strip().upper()
+        if answer_key not in options:
+            self.send(uid, "Javobni A, B, C yoki D shaklida kiriting.")
+            return
+        state.setdefault("answers", {})[str(index)] = answer_key
+        index += 1
+        if index >= len(QUESTIONS):
+            score = 0
+            for i, q in enumerate(QUESTIONS):
+                selected = state.get("answers", {}).get(str(i), "")
+                if selected == q["answer"]:
+                    score += 1
+            percent = int(round((score / len(QUESTIONS)) * 100))
+            u = self.user(uid)
+            self.write(
+                "INSERT INTO quiz_results(user_id, full_name, telegram_id, score, total, percent, best_score, best_percent, attempts) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    uid,
+                    u["name"] if u else "",
+                    uid,
+                    score,
+                    len(QUESTIONS),
+                    percent,
+                    score,
+                    percent,
+                    1,
+                ),
+            )
+            self.clear_session(uid)
+            self.send(uid, f"Test yakunlandi.\nTo‘g‘ri javoblar: {score}/{len(QUESTIONS)}\nFoiz: {percent}%\nNatija: {'Yuksak natija' if percent >= 70 else 'Yaxshi natija' if percent >= 50 else 'Qayta urinib ko‘ring'}")
+            return
+        state["index"] = index
+        self.session(uid, "quiz", state)
+        q = QUESTIONS[index]
+        self.send(uid, f"Savol {index + 1}/{len(QUESTIONS)}\n{q['question']}\nA) {q['options'][0]}\nB) {q['options'][1]}\nC) {q['options'][2]}\nD) {q['options'][3]}")
+
+
+
+def create_web_app(state):
+    async def ping(request):
+        return web.json_response({"service": "Koordinatorlar platformasi", "status": "ok"})
+
+    async def health(request):
+        healthy = state.get("ready", False) and time.monotonic() - state.get("last_poll", 0) < 180
+        return web.json_response({"status": "ok" if healthy else "starting_or_unavailable"}, status=200 if healthy else 503)
+
+    app = web.Application()
+    app.router.add_get("/", ping)
+    app.router.add_get("/health", health)
+    return app
+
+
+def run_polling(token, owner, db_path, directions, stop, state):
+    app = App(db_path, Telegram(token), owner, directions)
+    try:
+        me = app.api.call("getMe")
+        hook = app.api.call("getWebhookInfo")
+        if hook.get("url"):
+            raise RuntimeError("Webhook faollashtirilgan. Polling uchun avval webhookni o‘chiring.")
+        state["ready"] = True
+        print("Bot ishga tushdi: @" + me["username"], flush=True)
+        offset = int((app.one("SELECT value FROM meta WHERE key='offset'") or {"value": "0"})["value"])
+        last = 0
+        while not stop.is_set():
+            try:
+                updates = app.api.call("getUpdates", offset=offset, timeout=25, allowed_updates=["message"])
+                state["last_poll"] = time.monotonic()
+                for update in updates:
+                    if stop.is_set():
+                        break
+                    if "message" in update:
+                        msg = update["message"]
+                        if msg.get("text") and msg["text"].strip() and msg["text"].strip().upper() in {"A", "B", "C", "D"}:
+                            app.handle_quiz_answer(msg["from"]["id"], msg["text"].strip())
+                        else:
+                            app.handle(msg)
+                    offset = update["update_id"] + 1
+                    app.write("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", ("offset", str(offset)))
+                if not stop.is_set() and time.monotonic() - last > 60:
+                    last = time.monotonic()
+            except RuntimeError as exc:
+                print(str(exc), flush=True)
+                stop.wait(5)
+    finally:
+        state["ready"] = False
+        app.db.close()
+
+
+async def serve(token, owner, port, db_path, directions):
+    stop = threading.Event()
+    shutdown = asyncio.Event()
+    state = {"ready": False, "last_poll": 0.0}
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, shutdown.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+    runner = web.AppRunner(create_web_app(state), access_log=None)
+    await runner.setup()
+    worker = waiter = None
+    try:
+        await web.TCPSite(runner, host="0.0.0.0", port=port).start()
+        print(f"HTTP server: 0.0.0.0:{port}", flush=True)
+        worker = asyncio.create_task(asyncio.to_thread(run_polling, token, owner, db_path, directions, stop, state))
+        waiter = asyncio.create_task(shutdown.wait())
+        done, _ = await asyncio.wait({worker, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if worker in done:
+            await worker
+    finally:
+        stop.set()
+        if waiter:
+            waiter.cancel()
+        await runner.cleanup()
+        if worker:
+            await asyncio.shield(worker)
+
+
+def main():
+    load_env()
+    token = os.environ.get("BOT_TOKEN", "").strip()
+    owner = os.environ.get("OWNER_ID", "").strip()
+    if not token:
+        raise SystemExit("BOT_TOKEN environment variable bo‘sh bo‘lishi mumkin emas.")
+    if not owner.isdigit() or int(owner) <= 0:
+        raise SystemExit("OWNER_ID musbat raqam bo‘lishi kerak.")
+    try:
+        port = int(os.environ.get("PORT", "10000"))
+        if not 1 <= port <= 65535:
+            raise ValueError()
+    except ValueError:
+        raise SystemExit("PORT 1–65535 oralig‘idagi son bo‘lishi kerak.") from None
+    db_path = Path(os.environ.get("DATABASE_PATH", str(ROOT / "data.sqlite3")))
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        asyncio.run(serve(token, int(owner), port, str(db_path), DIRECTIONS))
+    except KeyboardInterrupt:
+        print("Bot to‘xtatildi.", flush=True)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
+
+
+if __name__ == "__main__":
+    main()
+
+
+""",
+{"path":"bot.py","content":""},
+{"path":"quiz_questions.py","content":"QUESTIONS = [
+    {
+        "question": "Qaysi davlat birinchi bo‘lib Yer yuzidagi kosmik stantsiyalaridan biriga ega bo‘lgan davlat hisoblanadi?",
+        "options": ["Rossiya", "AQSh", "Xitoy", "Fransiya"],
+        "answer": "A",
+    },
+    {
+        "question": "Birinchi Android operatsion tizimi qachon chiqarilgan edi?",
+        "options": ["2007", "2005", "2010", "2003"],
+        "answer": "A",
+    },
+    {
+        "question": "O‘quvchi ozon qatlami nima uchun muhim?",
+        "options": ["Yer atmosferasini quyosh nurlari bilan himoya qiladi", "Yerning qizib ketishini tezlashtiradi", "Yerdagi suvni ko‘paytiradi", "Teng bo‘lishi kerak"],
+        "answer": "A",
+    },
+    {
+        "question": "Qaysi hayvon ko‘p yillik uyqusdan keyin uyg‘onadi?",
+        "options": ["Baliq", "Tuxum qo‘yuvchi qush", "Yo‘lbars", "O‘rdak"],
+        "answer": "A",
+    },
+    {
+        "question": "Yevropa davlatlaridan qaysi biri ""Sheng"" deb ataladi?",
+        "options": ["Italiya", "Germaniya", "Shvetsiya", "Norvegiya"],
+        "answer": "C",
+    },
+    {
+        "question": "Dengizning eng chuqur joyi qaysi okeanda joylashgan?",
+        "options": ["Tinch okeani", "Atlantika okeani", "Hind okeani", "Shimoliy Muz okeani"],
+        "answer": "A",
+    },
+    {
+        "question": "Koinotdagi eng katta quyosh tizimi qaysi?",
+        "options": ["Venera", "Yupiter", "Merkuriy", "Mars"],
+        "answer": "B",
+    },
+    {
+        "question": "Qaysi hayvonning yuragi to‘g‘ridan-to‘g‘ri boshidan boshlanadi?",
+        "options": ["Muhim", "Qush", "Baliq", "Sutemizuvchilar"],
+        "answer": "C",
+    },
+    {
+        "question": "Qaysi so‘z qatoridagi faktlar sog‘lom turmush tarzi uchun mos?",
+        "options": ["Sovutish, yurg‘izish, harakatlanish, ovqatlanish", "Dam olish, yaxshi ovqat, suvsizlik", "Qat’iy charchoq, kechki ovqat", "Telefonni kechga qadar ishlatish"],
+        "answer": "A",
+    },
+    {
+        "question": "Qaysi tarixiy shaxs “O‘ylar yozmayapti, vazifasini bajaryapti” degan iboraga oid?",
+        "options": ["Alisher Navoiy", "Amir Temur", "Beruniy", "Bobur"],
+        "answer": "A",
+    },
+    {
+        "question": "Yulduzlar nimadan iborat?",
+        "options": ["Qattiq tog‘lardan", "Qizib ketgan gaz va changlardan", "Yalpi qog‘ozlardan", "Muzdan"],
+        "answer": "B",
+    },
+    {
+        "question": "Qaysi davlat “Qizil mayoq” sifatida tanilgan?",
+        "options": ["Fransiya", "Italiya", "Xitoy", "Yaponiya"],
+        "answer": "C",
+    },
+    {
+        "question": "Qanday oziq-ovqatlar vitaminlar bilan boy?",
+        "options": ["Sabzi, meva, ko‘kat", "Sirop, shakar", "Gazli ichimliklar", "Qaynatilgan kartoshka"],
+        "answer": "A",
+    },
+    {
+        "question": "Sun’iy yo‘ldosh qaysi maqsadda ishlatiladi?",
+        "options": ["O‘qituvchilik", "Telekommunikatsiya va ob-havoni kuzatish", "Yurak urishini o‘stad", "Loyihalarni qilish"],
+        "answer": "B",
+    },
+    {
+        "question": "Qaysi insonning vazifasi “koordinatorlik” bilan bog‘liq?",
+        "options": ["Vaqtni yaqin qilib olib ketish", "Maqsadni rejalashtirish va boshqarish", "Barcha mashinalar uchun ishlatish", "Yolg‘iz quritish"],
+        "answer": "B",
+    },
+]
+"""
+},{"path":"README.md","content":"# Koordinatorlar platformasi Telegram bot
+
+Bu loyiha Render uchun tayyorlangan Telegram bot bo‘lib, **polling** va **aiohttp web server** birga ishlaydi.
+
+## Asosiy xususiyatlar
+- Bot nomi va username o‘zgartirilmagan.
+- `BOT_TOKEN`, `OWNER_ID`, `PORT`, `DATABASE_PATH`, `ADMIN_PROFILE_URL`, `ADMIN_TG_ID`, `PROMO_CODE` environment variable orqali olinadi.
+- `polling` usulida ishlaydi, lekin `aiohttp` server ham yon tomondan xizmat ko‘rsatadi.
+- Barcha foydalanuvchi xabarlar va menyular o‘zbek tilida.
+- 8 ta yo‘nalish kiritilgan.
+- Topshiriq, hisobot, PRO obuna, promo kod, DLS turniri, bilim testi va murojaat tizimi mavjud.
+
+## Render uchun environment variable
+- `BOT_TOKEN` — Telegram bot tokeni
+- `OWNER_ID` — bosh administrator Telegram ID
+- `PORT` — Render beradigan port (odatda 10000)
+- `DATABASE_PATH` — SQLite fayl yo‘li, masalan `/tmp/data.sqlite3`
+- `ADMIN_PROFILE_URL` — admin profil havolasi
+- `ADMIN_TG_ID` — admin Telegram ID
+- `PROMO_CODE` — promo kod, masalan `z1a2b3at`
+
+## Loyiha ishga tushirish
+```bash
+python3 bot.py
+```
+
+## requirements
+```bash
+pip install -r requirements.txt
+```
+
+## Render deploy
+1. GitHub repositoryga push qiling.
+2. Render’da yangi Web Service yarating.
+3. `Start Command` ga quyidagilarni kiriting:
+```bash
+python3 bot.py
+```
+4. Environment variablesni to‘ldiring.
+5. Service ishga tushgandan so‘ng `/start` ni yuboring.
+
+## Eslatma
+- Maxfiy qiymatlar kodga yozilmaydi.
+- Token, promo kod, admin ID va profil havolasi environment variable orqali saqlanadi.
+- Loglarda token yoki promo kod ko‘rsatilmaydi.
+"""}]}  
