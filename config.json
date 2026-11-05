@@ -1,5 +1,6 @@
 {
-  "KoordinatorlarUzBot": "Koordinatorlar platformasi",
+  "name": "KoordinatorlarUZ Bot",
+  "username": "KoordinatorlarUzBot",
   "directions": [
     "💻 IT va raqamli texnologiyalar",
     "📚 Ta’lim va ilm-fan",
@@ -8,6 +9,6 @@
     "🌱 Ekologiya va atrof-muhit muhofazasi",
     "🤝 Volontyorlik va ijtimoiy loyihalar",
     "🚀 Tadbirkorlik va innovatsiyalar",
-    "⚖️ Huquqiy savodxonlik va fuqarolik tashabbuslari"
+    "📰 Media va axborot"
   ]
 }

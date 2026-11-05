@@ -1,0 +1,19 @@
+{
+  "questions": [
+    {"question":"Yer Quyosh atrofini taxminan qancha vaqtda bir marta aylanib chiqadi?","options":["24 soatda","365 kunda","30 kunda","12 soatda"],"correct":1},
+    {"question":"O‘zbekiston poytaxti qaysi shahar?","options":["Samarqand","Buxoro","Toshkent","Xiva"],"correct":2},
+    {"question":"Suvning kimyoviy formulasi qaysi?","options":["CO₂","H₂O","O₂","NaCl"],"correct":1},
+    {"question":"Dunyodagi eng katta okean qaysi?","options":["Atlantika","Hind","Shimoliy Muz","Tinch"],"correct":3},
+    {"question":"Kompyuterning markaziy hisoblash qurilmasi nima deb ataladi?","options":["CPU","Monitor","Klaviatura","Sichqoncha"],"correct":0},
+    {"question":"Bir kilometr necha metr?","options":["100","500","1000","10 000"],"correct":2},
+    {"question":"Fotosintez jarayonida o‘simliklar asosan qaysi gazni yutadi?","options":["Kislorod","Karbonat angidrid","Azot","Vodorod"],"correct":1},
+    {"question":"O‘zbekiston mustaqillik kuni qaysi sana?","options":["1-sentabr","8-dekabr","21-mart","9-may"],"correct":0},
+    {"question":"Kitob yozuvchi ijodkor qanday ataladi?","options":["Muharrir","Muallif","Noshir","Rassom"],"correct":1},
+    {"question":"Sportda futbol jamoasi maydonda odatda nechta o‘yinchi bilan qatnashadi?","options":["9","10","11","12"],"correct":2},
+    {"question":"Quyosh sistemasidagi eng katta sayyora qaysi?","options":["Yer","Mars","Yupiter","Venera"],"correct":2},
+    {"question":"Internetdagi sahifalarni ko‘rish uchun qaysi dastur ishlatiladi?","options":["Brauzer","Kalkulyator","Arxivator","Drayver"],"correct":0},
+    {"question":"O‘zbekiston davlat tili qaysi til?","options":["Tojik tili","O‘zbek tili","Qozoq tili","Rus tili"],"correct":1},
+    {"question":"Tabiatni asrash uchun chiqindilarni nima qilish foydali?","options":["Daryoga tashlash","Saralab qayta ishlashga topshirish","Ko‘chada qoldirish","Yoqib yuborish"],"correct":1},
+    {"question":"Jamoa ishida vazifalarni aniq taqsimlash nimaga yordam beradi?","options":["Ishni tartibli va samarali bajarishga","Vaqtni yo‘qotishga","Muloqotni to‘xtatishga","Maqsadni unutishga"],"correct":0}
+  ]
+}
